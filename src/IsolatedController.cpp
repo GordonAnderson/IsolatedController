@@ -6,7 +6,6 @@
 // =============================================================================
 
 #define AppName        "IsolatedController"
-#define UseWireClient  true    // I2C client on the EXT1/EXT2 MIPS bus
 #define UseThreads     true    // 25 ms periodic Update() thread
 #define UseSPIflash    false   // deferred — see platformio.ini note
 
@@ -43,9 +42,6 @@ typedef struct
   int16_t   Size;
   char      Name[20];
   int8_t    Rev;
-  #if UseWireClient
-  int       TWIadd;
-  #endif
   unsigned int Signature;
 } Data;
 
@@ -55,9 +51,6 @@ Data Rev_1_data =
   sizeof(Data),
   AppName,
   1,
-  #if UseWireClient
-  0x20,   // TODO: confirm the TWI address MIPS expects for this module
-  #endif
   SIGNATURE
 };
 FlashStorage(flash_data, Data);
@@ -73,10 +66,6 @@ debug dbg(&cp);
 void SaveSettings(void);
 void RestoreSettings(void);
 void bootloader(void);
-#if UseWireClient
-void setTWIaddress(void);
-void getTWIaddress(void);
-#endif
 
 Command cmds[] =
 {
@@ -85,10 +74,6 @@ Command cmds[] =
   {"SAVE",    CMDfunction,  0, (void *)SaveSettings,   NULL, "Save system settings to internal flash"},
   {"RESTORE", CMDfunction,  0, (void *)RestoreSettings,NULL, "Restore system settings from internal flash"},
   {"BLOAD",   CMDfunction,  0, (void *)bootloader,     NULL, "Jump to bootloader for firmware update"},
-  #if UseWireClient
-  {"STWIADD", CMDfunction,  1, (void *)setTWIaddress,  NULL, "Set TWI address (hex); reboot to apply"},
-  {"GTWIADD", CMDfunction,  0, (void *)getTWIaddress,  NULL, "Return TWI address (hex)"},
-  #endif
   {NULL}
 };
 static CommandList cmdList = {cmds, NULL};
@@ -99,62 +84,8 @@ void Debug(void) { /* ad-hoc bring-up tests go here */ }
 void Update(void)
 {
   // TODO: DIO/Analog module polling goes here once those modules exist.
-  // DCbias readback polling lives in DCbias.cpp once real ADC readback is
-  // wired up (see the TODO in DCbiasGetVCmd()).
-}
-#endif
-
-// =============================================================================
-//  I2C (TWI) client — MIPS bus interface (unchanged pattern from before)
-// =============================================================================
-#if UseWireClient
-#include <WireHelper.h>
-WireHelper wh;
-
-void requestEvent(void) { wh.requestEventProcessor(); }
-
-void receiveEvent(int howMany)
-{
-  uint8_t cmd;
-  int     i;
-  static  bool TWITALKmode = false;
-
-  while (Wire.available() != 0)
-  {
-    cmd = Wire.read();
-    if (TWITALKmode)
-    {
-      if (cmd == ESC) TWITALKmode = false;
-      else { cp.selectStream(&wh.sb); cp.rb->put(cmd); }
-    }
-    else switch (cmd)
-    {
-      case TWI_SERIAL:
-        cp.selectStream(&wh.sb);
-        TWITALKmode = true;
-        break;
-      case TWI_CMD:
-        wh.sb.clear();
-        for (i = 0; i < 100; i++)
-        {
-          if (Wire.available() != 0)
-          {
-            cmd = Wire.read();
-            cp.rb->put(cmd);
-            if (cmd == '\n') break;
-          }
-          delayMicroseconds(100);
-        }
-        cp.selectStream(&wh.sb);
-        cp.processCommands();
-        break;
-      case TWI_READ_AVAILABLE:
-        wh.setReturnAvailable();
-        break;
-      default:
-        break;
-    }
-  }
+  // DCbias readback monitoring runs on its own thread (DCbias_loop, 100 ms,
+  // created in DCbias_init()) — see DCbias.cpp.
 }
 #endif
 
@@ -258,14 +189,6 @@ void setup()
   cp.registerCommands(dbg.debugCommands());
   dbg.registerDebugFunction(Debug);
 
-  #if UseWireClient
-  Wire.begin(data.TWIadd);
-  Wire.onReceive(receiveEvent);
-  Wire.onRequest(requestEvent);
-  cp.registerStream(&wh.sb);
-  cp.setStreamActive(&wh.sb, false);
-  #endif
-
   #if UseThreads
   SystemThread.setName((char *)"Update");
   SystemThread.onRun(Update);
@@ -330,6 +253,7 @@ void RestoreSettings(void)
   else cp.sendNAK(ERR_NOSDCARD);
 }
 
+
 void bootloader(void)
 {
   cp.sendACK();
@@ -342,17 +266,3 @@ void bootloader(void)
   while (true);
   #endif
 }
-
-#if UseWireClient
-void setTWIaddress(void)
-{
-  int i;
-  if (cp.getValue(&i, 0, 255, HEX)) { data.TWIadd = i; cp.sendACK(); }
-  else cp.sendNAK(ERR_BADARG);
-}
-void getTWIaddress(void)
-{
-  cp.sendACK(false);
-  cp.println(data.TWIadd, HEX);
-}
-#endif

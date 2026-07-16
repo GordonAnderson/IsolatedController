@@ -27,6 +27,17 @@
 //    SDCBONEOFF/DCBOFFRBENA — always act on board 0, matching MIPS (these
 //      flags are conceptually shared across both boards even though stored
 //      per-board-struct).
+//
+//  READBACK MONITOR — DCbias_init() starts a 100 ms thread (DCbias_loop,
+//  same name and interval as MIPS's DCbiasThread) that reads each card's
+//  AD7998 readback ADC (at DCbiasData.ADCadr), keeps a filtered readback
+//  per channel (served by GDCBV/GDCBALLV), and computes the worst
+//  setpoint-vs-readback error as a percentage of full scale. The filtered
+//  error (StrongFilter, same coefficient as MIPS) trips the supply off
+//  when it exceeds the STRPLVL/GTRPLVL threshold (% of FS, 0 disables —
+//  MIPS default 1.0). SDCBTEST/GDCBTEST enable/disable the error test.
+//  On trip (or SDCPWR,OFF) all channel DACs are driven to zero — the
+//  board's real supply-enable wiring is still TBD (see NOTES.md).
 // =============================================================================
 #pragma once
 #include <Arduino.h>
@@ -108,3 +119,12 @@ CommandList *DCbias_commands(void);
 // be called first so the right physical card is listening.
 void AD5668write(int8_t chan, uint16_t val);
 void AD5668enableInternalRef(void);
+
+// -- AD7998 (8-channel I2C readback ADC on the DCbias card) -------------------
+// Minimal port of MIPS's hardware-TWI AD7998 driver (src/Hardware.cpp,
+// AD7998_b) minus the Due-specific AtomicBlock/TWI-queue plumbing. Values
+// are left-justified to 16 bits, matching MIPS, so the same DCmon
+// calibration constants work unchanged. SelectBoard() must be called first,
+// same as the DAC. Single-channel read returns -1 on any bus error.
+int AD7998read(uint8_t adr, int8_t chan);
+int AD7998readAll(uint8_t adr, uint16_t *vals);

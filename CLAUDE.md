@@ -39,7 +39,7 @@ one.
 and exposes a `<Module>_commands()` accessor (mirrors GAACE_Core's own
 `debug.h`), rather than one central command table like MIPS's
 `Serial.cpp`. `IsolatedController.cpp` is the thin host: framework setup,
-the three I/O streams, `SelectBoard()`/`SelectedBoard()` (BRDSEL), and the
+the two I/O streams, `SelectBoard()`/`SelectedBoard()` (BRDSEL), and the
 EEPROM read/write helpers used for module discovery. It calls each
 module's own `_scan()`/`_init()` — there is deliberately no central
 `ScanHardware()` dispatcher. That's fine with one discoverable module type
@@ -52,12 +52,20 @@ module would re-read the same signature independently).
 - `include/IsolatedController.h` / `src/IsolatedController.cpp` — host:
   pin definitions, PCA9540 mux select, BRDSEL/`SelectBoard()`, CS
   (SWCLK/PA30) direct-PORT helpers, `ReadEEPROM()`/`WriteEEPROM()`,
-  commandProcessor setup, the three streams (`Serial`, `Serial1`,
-  `wh.sb`), thread scheduler.
+  commandProcessor setup, the two streams (`Serial`, `Serial1` — this
+  board is **not** a TWI/WireClient device; the old WireClient code was
+  removed), thread scheduler.
 - `include/DCbias.h` / `src/DCbias.cpp` — the DCbias module: discovery,
   `DCbDarray[2]` state, command table, minimal AD5668 SPI DAC driver
   (GAACE_Core has no AD5668 driver — MIPS's own is written against the
-  Due's multi-CS SPI/DMA hardware and doesn't port over).
+  Due's multi-CS SPI/DMA hardware and doesn't port over), minimal AD7998
+  I2C readback-ADC driver, and the readback monitor: `DCbias_init()`
+  starts a 100 ms `Thread` (`DCbias_loop`, same name/interval as MIPS's
+  `DCbiasThread`) that keeps filtered per-channel readbacks (served by
+  `GDCBV`/`GDCBALLV`), computes the worst setpoint-vs-readback error as
+  % of full scale, and trips power off when the `StrongFilter`-filtered
+  error exceeds the `STRPLVL` threshold — a port of MIPS's `DCbias_loop`
+  trip logic minus display/UI.
 
 ## Three I2C/bus channels — don't mix these up
 
@@ -100,12 +108,16 @@ if the real MIPS struct ever changes, mirror the change here exactly.
 There is no separate magic-number signature — validity is checked by
 matching the `Name` field against `"DCbias"`, exactly like MIPS's
 `ScanHardware()`. The struct also has **no power-enable field** — MIPS
-handles that elsewhere (a relay/enable line outside `DCbiasData`);
-`SDCPWR`/`GDCPWR` here are currently a local-static stub, not persisted.
+handles that elsewhere (a relay/enable line outside `DCbiasData`).
+`SDCPWR`/`GDCPWR` (ON|OFF, MIPS conventions) track a module-level state:
+since this board's supply-enable wiring is still unconfirmed, "off" (or a
+readback-error trip) drives every channel DAC to zero and power-on
+reapplies the stored setpoints — the DACs are the only protective control
+available until the real enable line is identified.
 
 ## Commands implemented (milestone 1)
 
-Host-level: `GVER`, `?NAME`, `SAVE`, `RESTORE`, `BLOAD`, `STWIADD`, `GTWIADD`.
+Host-level: `GVER`, `?NAME`, `SAVE`, `RESTORE`, `BLOAD`.
 
 DCbias (argument conventions pulled directly from MIPS's `Serial.cpp`/
 `DCbias.cpp` — don't guess these, they're load-bearing for host
@@ -116,7 +128,10 @@ compatibility):
   `GDCBCHOF`, `SDCBCHMK`, `GDCBCHMK`.
 - **Always board 0**: `SDCBONEOFF`, `DCBOFFRBENA`.
 - **Bulk / setup**: `SDCBALL`, `GDCBALL`, `GDCBALLV`, `SDCBCHNS`.
-- `SDCPWR`/`GDCPWR` — stub, see note above.
+- **Monitor / power**: `SDCPWR`/`GDCPWR` (ON|OFF — see the power note
+  above), `STRPLVL`/`GTRPLVL` (readback-error trip level, % of FS,
+  0 disables, default 1.0 matching MIPS), `SDCBTEST`/`GDCBTEST`
+  (enable/disable readback error testing).
 
 ## Explicitly deferred (not in scope yet — don't add without asking)
 
@@ -133,8 +148,9 @@ compatibility):
 
 ## Open questions (real gaps, not just style choices)
 
-1. External card's ADC readback chip and TWI address — `GDCBV`/`GDCBALLV`
-   currently echo the setpoint instead of reading real hardware.
+1. Readback assumes the card's ADC is an AD7998 at `DCbiasData.ADCadr`
+   (the chip MIPS's own DCbias cards use) — confirm against real hardware;
+   the default `ADCadr` (0x50) in `DCbD_defaults` is still unverified.
 2. `NumChannels` / voltage range defaults are placeholders (4 ch, ±100V).
 3. Combined offset math (`OffsetOffset` + `ChannelOffset` + mask) is
    stored/round-trips but not yet applied to the DAC output.

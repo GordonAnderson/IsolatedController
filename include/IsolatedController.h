@@ -30,16 +30,6 @@
 
 #define SIGNATURE  0xAA55A5A7
 
-#define ESC   27
-#define ENQ    5
-
-#if UseWireClient
-#define TWI_SERIAL          0x27
-#define TWI_CMD              0x7F
-#define TWI_READ_AVAILABLE  0x82
-#define TWI_READ_AVALIBLE   TWI_READ_AVAILABLE
-#endif
-
 // =============================================================================
 //  PIN DEFINITIONS — IsolatedControllerR1.0
 // =============================================================================

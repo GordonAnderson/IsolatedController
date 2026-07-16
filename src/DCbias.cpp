@@ -8,8 +8,11 @@
 #include "DCbias.h"
 #include "IsolatedController.h"   // pins, PCA9540 mux, csWrite(), ReadEEPROM, SelectBoard
 #include <Errors.h>
+#include <Thread.h>
+#include <ThreadController.h>
 
-extern commandProcessor cp;   // defined in IsolatedController.cpp
+extern commandProcessor cp;       // defined in IsolatedController.cpp
+extern ThreadController control;  // defined in IsolatedController.cpp
 
 DCbiasData DCbDarray[MAXDCBBOARDS];
 bool       DCbBoardPresent[MAXDCBBOARDS] = {false, false};
@@ -49,6 +52,35 @@ static DCbiasData DCbD_defaults =
 };
 
 // =============================================================================
+//  Readback monitor state — mirrors MIPS's DCbias_loop() machinery
+//  (src/DCbias.cpp) minus the display/UI plumbing this board doesn't have.
+// =============================================================================
+static Thread DCbiasThread = Thread();
+
+#define StrongFilter 0.05   // VerrorFiltered coefficient — same value as MIPS
+
+static float Readbacks[MAXDCBBOARDS][MAXDCBCHANNELS];  // filtered readbacks, volts
+static float Verror           = 0;    // worst current setpoint-vs-readback error, % of FS
+static int   VerrorCh         = 0;    // channel (1-based, flat) with the worst error
+static float VerrorFiltered   = 0;    // filtered error the trip decision uses
+static float VerrorThreshold  = 1.0;  // STRPLVL/GTRPLVL — trip level, % of FS; 0 disables.
+                                      // 1.0 matches MIPSconfigData's default.
+static bool  DCbiasTestEnable = true; // SDCBTEST — FALSE disables the error test
+static int   MonitorDelay     = 0;    // loop passes left before error testing resumes
+static bool  DCbiasPowerEnable = true;// SDCPWR/GDCPWR state; MIPS's PowerEnable default
+static bool  Tripped          = false;
+static float TrpLvlRange[2]   = {0, 100};
+
+// Call after any commanded output change or power-on — holds off the trip
+// test long enough for the outputs and readback filters to settle (same
+// intent as MIPS's DelayMonitoring(): 10 passes at 100 ms = 1 s).
+static void DelayMonitoring(void)
+{
+  MonitorDelay = 10;
+  VerrorFiltered = 0;
+}
+
+// =============================================================================
 //  AD5668 — 8-channel SPI DAC, minimal driver
 // =============================================================================
 //  32-bit frame: [Cmd(4b) | Addr/Chan(4b) | Data(16b) | don't-care(4b)]
@@ -80,6 +112,125 @@ void AD5668write(int8_t chan, uint16_t val)
 void AD5668enableInternalRef(void)
 {
   AD5668frame(8, 0, 1);
+}
+
+// =============================================================================
+//  AD7998 — 8-channel I2C readback ADC on the DCbias card, minimal driver
+// =============================================================================
+//  Port of MIPS's hardware-TWI path (AD7998_b, src/Hardware.cpp) minus the
+//  Due-specific AtomicBlock/TWI-queue plumbing. The address pointer byte is
+//  written twice — the second conversion gives the input mux time to settle
+//  (MIPS's 9/14/2020 cross-talk fix). Results are left-justified to 16 bits
+//  so MIPS's DCmon calibration constants apply unchanged.
+int AD7998read(uint8_t adr, int8_t chan)
+{
+  Wire.beginTransmission(adr);
+  Wire.write(0x80 | (chan << 4));
+  Wire.write(0x80 | (chan << 4));
+  if (Wire.endTransmission() != 0) return -1;
+  if (Wire.requestFrom((int)adr, 2) != 2) return -1;
+
+  int hi = Wire.read();
+  int lo = Wire.read();
+  if (hi < 0 || lo < 0) return -1;
+  unsigned int val = ((hi << 8) & 0xFF00) | (lo & 0xFF);
+  if ((val & 0x7000) != (unsigned int)(chan << 12)) return -1;  // echo of chan bits
+  return (int)((val & 0xFFF) << 4);
+}
+
+int AD7998readAll(uint8_t adr, uint16_t *vals)
+{
+  for (int i = 0; i < 8; i++)
+  {
+    int v = AD7998read(adr, i);
+    if (v == -1) return -1;
+    vals[i] = (uint16_t)v;
+  }
+  return 0;
+}
+
+// =============================================================================
+//  Power control + readback monitor loop
+// =============================================================================
+//  TODO: drive the real supply-enable hardware once its wiring on this board
+//  is confirmed (DCbiasData has no field for it — see NOTES.md). Until then
+//  "power off" means driving every channel DAC to zero, which is the only
+//  protective action this board has; setpoints are preserved and reapplied
+//  on power-on, the way MIPS's DCbias_loop() zeros/restores outputs around
+//  its PWR_ON line.
+static void SetDCbiasPower(bool on)
+{
+  if (on == DCbiasPowerEnable) return;
+  DCbiasPowerEnable = on;
+
+  pca9540SelectChannel(PCA9540_CHAN_EXT);
+  for (int b = 0; b < MAXDCBBOARDS; b++)
+  {
+    if (!DCbBoardPresent[b]) continue;
+    DCbiasData &d = DCbDarray[b];
+    SelectBoard(b);
+    for (int ch = 0; ch < d.NumChannels; ch++)
+    {
+      float v = on ? d.DCCD[ch].VoltageSetpoint : 0.0;
+      AD5668write(d.DCCD[ch].DCctrl.Chan, Value2Counts(v, &d.DCCD[ch].DCctrl));
+    }
+  }
+  if (on) { Tripped = false; DelayMonitoring(); }
+}
+
+//  Runs every 100 ms on DCbiasThread (created in DCbias_init) — the same
+//  job MIPS's DCbias_loop() does: read each card's readback ADC, keep a
+//  filtered per-channel readback (served by GDCBV/GDCBALLV), find the worst
+//  setpoint-vs-readback error as % of full scale, and trip the supply off
+//  when the filtered error exceeds VerrorThreshold.
+void DCbias_loop(void)
+{
+  uint16_t ADCvals[8];
+
+  pca9540SelectChannel(PCA9540_CHAN_EXT);
+
+  bool testEnable = DCbiasPowerEnable && DCbiasTestEnable && (MonitorDelay == 0);
+  if (MonitorDelay > 0) MonitorDelay--;
+
+  Verror = 0;
+  for (int b = 0; b < MAXDCBBOARDS; b++)
+  {
+    if (!DCbBoardPresent[b]) continue;
+    DCbiasData &d = DCbDarray[b];
+    SelectBoard(b);
+    if (AD7998readAll(d.ADCadr, ADCvals) != 0) continue;   // card didn't answer — skip this pass
+
+    for (int i = 0; i < d.NumChannels; i++)
+    {
+      // No offset readback this milestone — the offset setpoint stands in,
+      // same as MIPS's non-OffsetReadback path.
+      float V = Counts2Value(ADCvals[d.DCCD[i].DCmon.Chan], &d.DCCD[i].DCmon)
+                + d.DCoffset.VoltageSetpoint;
+      // Dynamic filter, same coefficients as MIPS (10/8/23 fix): track fast
+      // on big moves, filter hard once settled.
+      float flt = (fabsf(V - Readbacks[b][i]) < 2) ? 0.1 : 0.5;
+      Readbacks[b][i] = flt * V + (1 - flt) * Readbacks[b][i];
+
+      if (!testEnable) continue;
+      float expected = d.DCCD[i].VoltageSetpoint;
+      if ((d.OffsetChanMsk & (1 << i)) != 0) expected += d.ChannelOffset;
+      float errorPercentage = (fabsf(Readbacks[b][i] - expected) / d.MaxVoltage) * 100.0;
+      if (errorPercentage > Verror)
+      {
+        Verror = errorPercentage;
+        VerrorCh = b * MAXDCBCHANNELS + i + 1;   // MIPS's DCBadd2chan(b, i)
+      }
+    }
+  }
+
+  VerrorFiltered = StrongFilter * Verror + (1 - StrongFilter) * VerrorFiltered;
+  if (DCbiasPowerEnable && (VerrorThreshold > 0) && (VerrorFiltered > VerrorThreshold))
+  {
+    // Same trip action as MIPS minus the display popup — the full MIPS
+    // controller sees the trip by polling GDCPWR (and GTRPLVL/GDCBALLV).
+    SetDCbiasPower(false);
+    Tripped = true;
+  }
 }
 
 // =============================================================================
@@ -143,14 +294,32 @@ void DCbias_init(int8_t board, uint8_t addr)
   }
   DCbDarray[board].EEPROMadr = addr;
 
+  // Drive the DACs to the restored setpoints (or hold at zero if power is
+  // off) — same net effect as MIPS's DCbias_loop() applying the restored
+  // configuration after DCbias_init().
   AD5668enableInternalRef();
   for (int ch = 0; ch < DCbDarray[board].NumChannels; ch++)
   {
+    float v = DCbiasPowerEnable ? DCbDarray[board].DCCD[ch].VoltageSetpoint : 0.0;
     AD5668write(DCbDarray[board].DCCD[ch].DCctrl.Chan,
-                Value2Counts(0.0, &DCbDarray[board].DCCD[ch].DCctrl));
+                Value2Counts(v, &DCbDarray[board].DCCD[ch].DCctrl));
   }
+  for (int ch = 0; ch < MAXDCBCHANNELS; ch++) Readbacks[board][ch] = 0.0;
 
   DCbBoardPresent[board] = true;
+
+  // The first board found starts the readback monitor — same 100 ms
+  // DCbiasThread MIPS's DCbias_init() configures on first init.
+  static bool monitorStarted = false;
+  if (!monitorStarted)
+  {
+    DCbiasThread.setName((char *)"DCbias");
+    DCbiasThread.onRun(DCbias_loop);
+    DCbiasThread.setInterval(100);
+    control.add(&DCbiasThread);
+    monitorStarted = true;
+  }
+  DelayMonitoring();
 }
 
 // =============================================================================
@@ -185,8 +354,12 @@ static void DCbiasSetCmd(void)
   if (!cp.getValue(&value, d.MinVoltage, d.MaxVoltage)) { cp.sendNAK(ERR_BADARG); return; }
 
   d.DCCD[localCh].VoltageSetpoint = value;
-  SelectBoard(board);
-  AD5668write(d.DCCD[localCh].DCctrl.Chan, Value2Counts(value, &d.DCCD[localCh].DCctrl));
+  if (DCbiasPowerEnable)
+  {
+    SelectBoard(board);
+    AD5668write(d.DCCD[localCh].DCctrl.Chan, Value2Counts(value, &d.DCCD[localCh].DCctrl));
+  }
+  DelayMonitoring();
   cp.sendACK();
 }
 
@@ -207,14 +380,10 @@ static void DCbiasGetVCmd(void)
   if ((board = DCbiasCH2Brd(ch)) < 0) { cp.sendNAK(ERR_INVALIDCHAN); return; }
   int localCh = (ch - 1) % MAXDCBCHANNELS;
 
-  // TODO: real ADC readback from DCbDarray[board].ADCadr once that chip is
-  // confirmed, e.g.:
-  //   SelectBoard(board);
-  //   float v = AnalogIn(AD5593readADC, &DCbDarray[board].DCCD[localCh].DCmon, 4);
-  float v = DCbDarray[board].DCCD[localCh].VoltageSetpoint;   // stand-in: echo setpoint
-
+  // Filtered readback maintained by the DCbias_loop() monitor thread —
+  // same source MIPS's GDCBV serves (DCbiasStates[]->Readbacks[]).
   cp.sendACK(false);
-  cp.println(v);
+  cp.println(Readbacks[board][localCh]);
 }
 
 // -- Offset control: channel-indexed (SDCBOF/GDCBOF/SDCBOFFENA) --------------
@@ -236,8 +405,12 @@ static void DCbiasSetOffsetCmd(void)   // SDCBOF, ch, value
     for (int b = 0; b < MAXDCBBOARDS; b++)
       if (DCbBoardPresent[b]) DCbDarray[b].DCoffset.VoltageSetpoint = value;
   }
-  SelectBoard(board);
-  AD5668write(d.DCoffset.DCctrl.Chan, Value2Counts(value, &d.DCoffset.DCctrl));
+  if (DCbiasPowerEnable)
+  {
+    SelectBoard(board);
+    AD5668write(d.DCoffset.DCctrl.Chan, Value2Counts(value, &d.DCoffset.DCctrl));
+  }
+  DelayMonitoring();
   cp.sendACK();
 }
 
@@ -305,6 +478,7 @@ static void DCbiasSetOffOffCmd(void)   // SDCBOFOF, board, value
   // TODO: apply to the offset DAC output alongside DCoffset.VoltageSetpoint
   // once the combined offset math is worked out — echoed to the struct for
   // now so GDCBOFOF/round-tripping works.
+  DelayMonitoring();
   cp.sendACK();
 }
 
@@ -326,6 +500,7 @@ static void DCbiasSetCHOffCmd(void)   // SDCBCHOF, board, value
   if (!cp.getValue(&value)) { cp.sendNAK(ERR_BADARG); return; }
   DCbDarray[board].ChannelOffset = value;
   // TODO: apply to channels enabled via OffsetChanMsk — see the TODO above.
+  DelayMonitoring();
   cp.sendACK();
 }
 
@@ -357,21 +532,21 @@ static void DCbiasGetCHMaskCmd(void)   // GDCBCHMK, board
   cp.println(DCbDarray[board].OffsetChanMsk, HEX);
 }
 
-// -- Power (no dedicated field in DCbiasData — see NOTES.md) -----------------
-static void DCbiasPowerSetCmd(void)
+// -- Power (ON|OFF — matches MIPS's DCbiasPowerSet/DCbiasPower conventions).
+//    See SetDCbiasPower() above for what "off" means on this board.
+static void DCbiasPowerSetCmd(void)   // SDCPWR, ON|OFF
 {
   char *state;
-  if (!cp.getValue(&state,"TRUE,FALSE")) { cp.sendNAK(ERR_BADARG); return; }
-  static bool powerEnable = false;   // TODO: confirm how power enable should
-  if(strcmp(state,"TRUE") == 0) powerEnable = true;               //       actually be wired on this board.
-  else powerEnable = false;
+  if (!cp.getValue(&state,"ON,OFF")) { cp.sendNAK(ERR_BADARG); return; }
+  SetDCbiasPower(strcmp(state,"ON") == 0);
   cp.sendACK();
 }
 
-static void DCbiasPowerGetCmd(void)
+static void DCbiasPowerGetCmd(void)   // GDCPWR
 {
   cp.sendACK(false);
-  cp.println("FALSE");   // TODO: wire to the real power-enable state
+  if (DCbiasPowerEnable) cp.println("ON");
+  else                   cp.println("OFF");
 }
 
 // -- Bulk commands (channel-indexed, spans whichever boards are present) ----
@@ -390,9 +565,13 @@ static void DCbiasSetAllCmd(void)   // SDCBALL, v1, v2, ...
     DCbiasData &d = DCbDarray[board];
     if (!cp.getValue(&value, d.MinVoltage, d.MaxVoltage)) { cp.sendNAK(ERR_BADARG); return; }
     d.DCCD[localCh].VoltageSetpoint = value;
-    SelectBoard(board);
-    AD5668write(d.DCCD[localCh].DCctrl.Chan, Value2Counts(value, &d.DCCD[localCh].DCctrl));
+    if (DCbiasPowerEnable)
+    {
+      SelectBoard(board);
+      AD5668write(d.DCCD[localCh].DCctrl.Chan, Value2Counts(value, &d.DCCD[localCh].DCctrl));
+    }
   }
+  DelayMonitoring();
   cp.sendACK();
 }
 
@@ -420,8 +599,7 @@ static void DCbiasReportAllValuesCmd(void)   // GDCBALLV
   {
     int board = DCbiasCH2Brd(ch);
     int localCh = (ch - 1) % MAXDCBCHANNELS;
-    // TODO: real ADC readback — see DCbiasGetVCmd() above.
-    cp.print(DCbDarray[board].DCCD[localCh].VoltageSetpoint);
+    cp.print(Readbacks[board][localCh]);   // maintained by DCbias_loop()
     if (ch < totalCh) cp.print(",");
   }
   cp.println("");
@@ -458,8 +636,10 @@ static Command DCbiasCmds[] =
   {"SDCBCHMK",   CMDfunction, 2, (void *)DCbiasSetCHMaskCmd,         NULL, "Set the board's channel offset mask (hex): board, mask"},
   {"GDCBCHMK",   CMDfunction, 1, (void *)DCbiasGetCHMaskCmd,         NULL, "Get the board's channel offset mask (hex): board"},
 
-  {"SDCPWR",     CMDfunction, 1, (void *)DCbiasPowerSetCmd,          NULL, "Set DC bias power, TRUE or FALSE"},
-  {"GDCPWR",     CMDfunction, 0, (void *)DCbiasPowerGetCmd,          NULL, "Get DC bias power state"},
+  {"SDCPWR",     CMDfunction, 1, (void *)DCbiasPowerSetCmd,          NULL, "Set DC bias power, ON or OFF"},
+  {"GDCPWR",     CMDfunction, 0, (void *)DCbiasPowerGetCmd,          NULL, "Get DC bias power state, ON or OFF"},
+  {"?TRPLVL",    CMDfloat,   -1, (void *)&VerrorThreshold, (void *)TrpLvlRange, "DC bias readback error trip level, % of FS; 0 disables"},
+  {"?DCBTEST",   CMDbool,    -1, (void *)&DCbiasTestEnable,          NULL, "Enable DC bias readback error testing, TRUE or FALSE"},
 
   {"SDCBALL",    CMDfunction, -1,(void *)DCbiasSetAllCmd,            NULL, "Set all DC bias channel setpoints: v1,v2,..."},
   {"GDCBALL",    CMDfunction, 0, (void *)DCbiasReportAllSetpointsCmd,NULL, "Report all DC bias setpoints"},
