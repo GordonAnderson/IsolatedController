@@ -55,7 +55,7 @@ Data Rev_1_data =
 };
 FlashStorage(flash_data, Data);
 
-const char *Version = AppName ", version 0.2 (milestone 1 — framework + DCbias hosting)";
+const char *Version = AppName ", version 0.2";
 
 // =============================================================================
 //  Command processor
