@@ -78,7 +78,14 @@ Command cmds[] =
 };
 static CommandList cmdList = {cmds, NULL};
 
-void Debug(void) { /* ad-hoc bring-up tests go here */ }
+void Debug(void) 
+{ 
+  while(1)
+  {
+     csWrite(true);
+     csWrite(false);
+  }
+}
 
 #if UseThreads
 void Update(void)
@@ -200,9 +207,9 @@ void setup()
   pinMode(PIN_BRDSEL, OUTPUT);
   SelectBoard(0);   // default to board 0 ("A") at boot
 
-  pinMode(PIN_ADDR0, INPUT);
-  pinMode(PIN_ADDR1, INPUT);
-  pinMode(PIN_ADDR2, INPUT);
+  pinMode(PIN_ADDR0, OUTPUT);
+  pinMode(PIN_ADDR1, OUTPUT);
+  pinMode(PIN_ADDR2, OUTPUT);
 
   // TODO: confirm direction — placeholder as inputs.
   pinMode(PIN_GRDSTA, INPUT);

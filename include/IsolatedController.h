@@ -78,13 +78,18 @@ int  SelectedBoard(void);
 // TODO: confirm CS polarity — assumed active-low (typical for SPI CS).
 static inline void csPinMode(void)
 {
-  PORT->Group[PORTA].DIRSET.reg = PORT_PA30;
-  PORT->Group[PORTA].OUTSET.reg = PORT_PA30;
+  // 1. Disable the peripheral multiplexer on PA30 so it acts as standard GPIO
+  PORT->Group[0].PINCFG[30].bit.PMUXEN = 0;
+
+  // 2. Set PA30 as a Digital Output
+  PORT->Group[0].DIRSET.reg = PORT_PA30;
+
+  //PORT->Group[0].DIRSET.reg = PORT_PA30;
 }
 static inline void csWrite(bool active)
 {
-  if (active) PORT->Group[PORTA].OUTCLR.reg = PORT_PA30;
-  else        PORT->Group[PORTA].OUTSET.reg = PORT_PA30;
+  if (active) PORT->Group[0].OUTCLR.reg = PORT_PA30;
+  else PORT->Group[0].OUTSET.reg = PORT_PA30;
 }
 
 // =============================================================================
@@ -93,8 +98,8 @@ static inline void csWrite(bool active)
 //  either side.
 // =============================================================================
 #define PCA9540_ADDR        0x70
-#define PCA9540_CHAN_LOCAL  0   // -> IC4/IC5 (onboard AD5593s: DIO + Analog)
-#define PCA9540_CHAN_EXT    1   // -> IC3 (buffer) -> EXT1/EXT2 "MIPS bus"
+#define PCA9540_CHAN_LOCAL  0x05   // -> IC4/IC5 (onboard AD5593s: DIO + Analog)
+#define PCA9540_CHAN_EXT    0x04   // -> IC3 (buffer) -> EXT1/EXT2 "MIPS bus"
 // TODO: confirm these two channel numbers against the schematic — the
 // numbering itself doesn't affect function, just which constant is which.
 

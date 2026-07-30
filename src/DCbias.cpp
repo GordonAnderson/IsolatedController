@@ -80,6 +80,18 @@ static void DelayMonitoring(void)
   VerrorFiltered = 0;
 }
 
+// This function will set the three address lines used for the SPI device selection. It is assumed
+// the bit directions have already been set.
+void SetAddress(int8_t addr)
+{
+  if(addr & 1) digitalWrite(PIN_ADDR0, HIGH);
+  else digitalWrite(PIN_ADDR0, LOW);
+  if(addr & 2) digitalWrite(PIN_ADDR1, HIGH);
+  else digitalWrite(PIN_ADDR1, LOW);
+  if(addr & 4) digitalWrite(PIN_ADDR2, HIGH);
+  else digitalWrite(PIN_ADDR2, LOW);
+}
+
 // =============================================================================
 //  AD5668 — 8-channel SPI DAC, minimal driver
 // =============================================================================
@@ -228,8 +240,8 @@ void DCbias_loop(void)
   {
     // Same trip action as MIPS minus the display popup — the full MIPS
     // controller sees the trip by polling GDCPWR (and GTRPLVL/GDCBALLV).
-    SetDCbiasPower(false);
-    Tripped = true;
+    //SetDCbiasPower(false);
+    //Tripped = true;
   }
 }
 
@@ -249,7 +261,10 @@ static bool isDCbiasSignature(const char *name)
 static void tryInitBoard(uint8_t addr)
 {
   char signature[100];
+  cp.println(addr);
   if (ReadEEPROM(signature, addr, 0, 100) != 0) return;
+  cp.println(signature);
+  
   if (!isDCbiasSignature(&signature[2])) return;   // offset 2 = Name field
 
   for (int b = 0; b < MAXDCBBOARDS; b++)
@@ -268,7 +283,6 @@ void DCbias_scan(void)
   for (int i = 0; i < NumModAdd; i++)
   {
     uint8_t addr = ModuleAddresses[i];
-
     SelectBoard(0);   // "A"
     tryInitBoard(addr);
 
@@ -357,6 +371,7 @@ static void DCbiasSetCmd(void)
   if (DCbiasPowerEnable)
   {
     SelectBoard(board);
+    SetAddress(d.DACspi);
     AD5668write(d.DCCD[localCh].DCctrl.Chan, Value2Counts(value, &d.DCCD[localCh].DCctrl));
   }
   DelayMonitoring();
